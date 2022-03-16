@@ -2,7 +2,7 @@
 
 # Main entry point
 
-# [[file:cache.org::*Main entry point][Main entry point:1]]
+# [[file:README.org::*Main entry point][Main entry point:1]]
 use_cache() {
     # show_dump $DIRENV_WATCHES
 
@@ -10,11 +10,11 @@ use_cache() {
         _debug "Ignoring cache, DIRENV_CACHE_IGNORE is set"
         return
     }
-    [[ -v DIRENV_CACHE_DEBUG ]] && {
+    [[ ${DIRENV_CACHE_DEBUG:-0} -gt 1 ]] && {
         set_x
         set -uo pipefail
     }
-
+    echo "$DIRENV_WATCHES"
     local cache_file="${1:-$(pwd)/.env}"
     shift
     if ! cache_is_valid "$cache_file" "$@"; then
@@ -25,8 +25,6 @@ use_cache() {
     fi
 
     _debug "Loading from cache ${cache_file}"
-
-    # watch_file
     dotenv_if_exists "$cache_file"
     exit 0
 }
@@ -35,7 +33,7 @@ use_cache() {
 # Check cache validity
 
 
-# [[file:cache.org::*Check cache validity][Check cache validity:1]]
+# [[file:README.org::*Check cache validity][Check cache validity:1]]
 cache_is_valid() {
     # Checks cache validity, and returns 0 for valid cache, nonzero for invalid cache.
     #
@@ -72,7 +70,7 @@ cache_is_valid() {
 # Build cache
 
 
-# [[file:cache.org::*Build cache][Build cache:1]]
+# [[file:README.org::*Build cache][Build cache:1]]
 build_cache() {
     # Builds the cache by calling ~direnv export~ in a clean login shell (which
     # is the "base" environment to diff against).
@@ -103,17 +101,18 @@ build_cache() {
     #
     # we use json/jq because the bash export uses $'' c-strings which are not
     # easy to get rid of with sed
-    local direnv_export_cmd="${direnv} watch ${shell} ${cache_file} && ${direnv} export json"
+    local direnv_export_cmd="${direnv} export json"
 
     # DIRENV_LOG_FORMAT='' will turn off direnv logging
     # DIRENV_CACHE_IGNORE=1 so that we can build the cache without using it
     local cache_contents=$(env -i \
         --chdir "$working_dir" \
         HOME="$HOME" \
+        TERM="$TERM" \
         DIRENV_CACHE_IGNORE=1 \
         DIRENV_LOG_FORMAT="" \
         "$shell" -ilc "$direnv_export_cmd" 2>"$stderr_file" |
-                               jq -r 'to_entries | map("export \(.key)=\(.value)")[]')
+                               jq -r 'to_entries | map("export \(.key)=\(.value|@sh)")[]')
 
     local status=$?
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
@@ -132,10 +131,22 @@ build_cache() {
 }
 # Build cache:1 ends here
 
+# Dependency files
+
+# each time direnv enters the directory it has to load from .envrc
+
+# but on each prompt, it only reloads if the watch list indicates that the env is stale
+
+
+
+# [[file:README.org::*Dependency files][Dependency files:1]]
+direnv show_dump $DIRENV_WATCHES | jq '.[].Path'
+# Dependency files:1 ends here
+
 # Is cache file the newest?
 
 
-# [[file:cache.org::*Is cache file the newest?][Is cache file the newest?:1]]
+# [[file:README.org::*Is cache file the newest?][Is cache file the newest?:1]]
 is_newest() {
     # Checks if cache_file is newer than all dependency files. Returns 0 if yes, nonzero if not.
     #
@@ -163,24 +174,31 @@ is_newest() {
 
 # Debug printing
 
-# [[file:cache.org::*Debug printing][Debug printing:1]]
+# [[file:README.org::*Debug printing][Debug printing:1]]
 _debug() {
     # Return status of this function is always the previous status.
     #
     # Prints $1 if DIRENV_CACHE_DEBUG is set. (Note that you probably have to
     # ~export~ it, not just set it, since all this code runs in a subshell)
-    local status=$?
+
+    {
+        local status=$?
+        [[ -o xtrace ]] && {
+            shopt -uo xtrace
+            local xtrace_was_on=1
+        }
+    } 2>/dev/null
+
     local msg=${1:?"Message required"}
     [[ -v DIRENV_CACHE_DEBUG ]] && echo "$msg (status: $status)" >&2
-    return $status
+
+    {
+        [[ ${xtrace_was_on:-0} -eq 1 ]] && shopt -so xtrace
+        return $status
+    } 2>/dev/null
 }
 # Debug printing:1 ends here
 
-# Emacs local variables
-
-
-# [[file:cache.org::*Emacs local variables][Emacs local variables:1]]
 # Local Variables:
 # sh-shell: bash
 # End:
-# Emacs local variables:1 ends here

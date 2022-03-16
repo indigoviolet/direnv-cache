@@ -5,10 +5,29 @@
 #+email: indigoviolet@gmail.com
 :END:
 
-* Direnv caching
+This is an implementation of caching for [[https://direnv.net/][direnv]].
 
+~direnv-cache~ caches the environment into a ~.env~ file using ~direnv~ (and then
+loads the ~.env~ using direnv itself).
+
+It supports rebuilds when [[*Cache validity][the cache becomes invalid]].
+
+* Motivation
+
+I use direnv for setting up [[https://python-poetry.org/][Poetry]] ([[https://github.com/direnv/direnv/wiki/Python#poetry][layout_poetry]]) or conda, and in these
+scenarios, the environment created via direnv doesn't change all that often, and
+is amenable to caching.
+
+I also use direnv in Emacs ([[https://github.com/purcell/envrc][envrc]]), and having fast loads would make my editor
+start up faster.
+
+I could use a ~.env~ directly but it's convenient to create the environment
+programmatically with direnv.
 
 * Installation
+
+The accompanying file [[cache.sh][cache.sh]] should be dropped into direnv's library: either
+appended to ~~/.config/direnv/direnvrc~ or dropped into ~~/.config/direnv/lib/~
 
 #+begin_src bash
 
@@ -16,11 +35,85 @@
 
 * Usage
 
+Add the ~use_cache~ function to the top of your ~.envrc~:
+
+
+#+begin_example
+$> cat .envrc
+
+#+end_example
+
+
+
+* Cache validity
+
+1. The cache file ~.env~ exists
+2. It is newer than any "dependencies" - which are assumed to be all the files
+   that direnv is watching (see ~direnv help show_private~ or ~watch_file~ in the
+   [[https://direnv.net/man/direnv-stdlib.1.html][stdlib]])
+3. A rebuild can be forced by setting (via ~export~) ~DIRENV_CACHE_REBUILD~
+
 * Environment variables
 
 - ~DIRENV_CACHE_IGNORE~ ::
 - ~DIRENV_CACHE_REBUILD~ ::
 - ~DIRENV_CACHE_DEBUG~ ::
+
+* Should this be built into direnv?
+
+* Implementation Notes
+** behavior of DIRENV_WATCHES
+
+- when we first hit .envrc code, DIRENV_WATCHES is already set in the environment and contains the .envrc and allow file
+- if you add a watch manually, it will append to DIRENV_WATCHES
+- but ~direnv export json~ will only show the watches added in the envrc (by default only the .envrc and allow file)
+- ~dotenv_if_exists~ will ~watch_file~ .env (appending to DIRENV_WATCHES)
+
+
+*** viewing dumps
+
+#+begin_src bash
+direnv show_dump $DIRENV_WATCHES
+#+end_src
+
+#+begin_src bash
+echo $DIRENV_WATCHES | python -c "import sys; import zlib; import base64; print(zlib.decompress(base64.urlsafe_b64decode(sys.stdin.read())).decode('utf-8'))" | jq '.'
+#+end_src
+
+
+** implementation notes
+
+- We build the cache by running ~direnv export json~ in a subshell with a (mostly)
+  clean environment (while ignoring caching), and then formatting the JSON into
+  dotenv with ~jq~. This is then dumped into .env.
+
+
+*** Watching .env
+
+.env will get watched when we use ~dotenv_if_exists~, which modifies
+DIRENV_WATCHES, but then immediately the DIRENV_WATCHES from the cache will
+overwrite this, so that .env will not be watched.
+
+Do we want to watch the cache file? I don't think so: users shouldn't be
+modifying it directly; if deleted, it will get recreated the next time ~direnv~
+tries to load something.
+
+Attempting to get the cache file into DIRENV_WATCHES turns out to be difficult -
+you need to first set the .env's DIRENV_WATCHES into the environment (to capture
+any watches set in .envrc), and then ~watch_file .env~, and then append that new
+DIRENV_WATCHES into .env (overriding the previous export).
+
+TODO: Can we do it like below, in one step?
+
+#+begin_example
+{ direnv watch json .env | jq -r '"export DIRENV_WATCHES=\(.DIRENV_WATCHES|@sh)"' >> .env; eval $(direnv watch zsh .env); }
+#+end_example
+
+
+
+
+
+
 
 
 
@@ -44,11 +137,11 @@ use_cache() {
         _debug "Ignoring cache, DIRENV_CACHE_IGNORE is set"
         return
     }
-    [[ -v DIRENV_CACHE_DEBUG ]] && {
+    [[ ${DIRENV_CACHE_DEBUG:-0} -gt 1 ]] && {
         set_x
         set -uo pipefail
     }
-
+    echo "$DIRENV_WATCHES"
     local cache_file="${1:-$(pwd)/.env}"
     shift
     if ! cache_is_valid "$cache_file" "$@"; then
@@ -59,8 +152,6 @@ use_cache() {
     fi
 
     _debug "Loading from cache ${cache_file}"
-
-    # watch_file
     dotenv_if_exists "$cache_file"
     exit 0
 }
@@ -136,17 +227,18 @@ build_cache() {
     #
     # we use json/jq because the bash export uses $'' c-strings which are not
     # easy to get rid of with sed
-    local direnv_export_cmd="${direnv} watch ${shell} ${cache_file} && ${direnv} export json"
+    local direnv_export_cmd="${direnv} export json"
 
     # DIRENV_LOG_FORMAT='' will turn off direnv logging
     # DIRENV_CACHE_IGNORE=1 so that we can build the cache without using it
     local cache_contents=$(env -i \
         --chdir "$working_dir" \
         HOME="$HOME" \
+        TERM="$TERM" \
         DIRENV_CACHE_IGNORE=1 \
         DIRENV_LOG_FORMAT="" \
         "$shell" -ilc "$direnv_export_cmd" 2>"$stderr_file" |
-                               jq -r 'to_entries | map("export \(.key)=\(.value)")[]')
+                               jq -r 'to_entries | map("export \(.key)=\(.value|@sh)")[]')
 
     local status=$?
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
@@ -163,10 +255,20 @@ build_cache() {
         return $status
     fi
 }
-
 #+end_src
 
 ** Dependency files
+
+each time direnv enters the directory it has to load from .envrc
+
+but on each prompt, it only reloads if the watch list indicates that the env is stale
+
+
+#+begin_src bash
+direnv show_dump $DIRENV_WATCHES | jq '.[].Path'
+#+end_src
+
+
 # get_watch_files() {
 
 # }
@@ -207,16 +309,28 @@ _debug() {
     #
     # Prints $1 if DIRENV_CACHE_DEBUG is set. (Note that you probably have to
     # ~export~ it, not just set it, since all this code runs in a subshell)
-    local status=$?
+
+    {
+        local status=$?
+        [[ -o xtrace ]] && {
+            shopt -uo xtrace
+            local xtrace_was_on=1
+        }
+    } 2>/dev/null
+
     local msg=${1:?"Message required"}
     [[ -v DIRENV_CACHE_DEBUG ]] && echo "$msg (status: $status)" >&2
-    return $status
+
+    {
+        [[ ${xtrace_was_on:-0} -eq 1 ]] && shopt -so xtrace
+        return $status
+    } 2>/dev/null
 }
 #+end_src
 
 ** Emacs local variables
 
-#+begin_src bash
+#+begin_src bash :comments no
 # Local Variables:
 # sh-shell: bash
 # End:
