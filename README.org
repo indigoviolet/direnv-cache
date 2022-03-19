@@ -7,10 +7,10 @@
 
 This is an implementation of caching for [[https://direnv.net/][direnv]].
 
-~direnv-cache~ caches the environment into a ~.env~ file using ~direnv~ (and then
-loads the ~.env~ using direnv itself).
-
-It supports rebuilds when [[*Cache validity][the cache becomes invalid]].
+~direnv-cache~ caches the environment into a ~.env~ file, and then loads from the
+.env if it is still valid. This could be helpful when re-entering a directory
+that has not changed since we last left it; we can restore the environment
+without fully executing the .envrc.
 
 * Motivation
 
@@ -21,13 +21,14 @@ is amenable to caching.
 I also use direnv in Emacs ([[https://github.com/purcell/envrc][envrc]]), and having fast loads would make my editor
 start up faster.
 
-I could use a ~.env~ directly but it's convenient to create the environment
-programmatically with direnv.
+I could create a ~.env~ manually but it's convenient to define it using direnv's
+primitives.
 
 * Installation
 
 The accompanying file [[cache.sh][cache.sh]] should be dropped into direnv's library: either
-appended to ~~/.config/direnv/direnvrc~ or dropped into ~~/.config/direnv/lib/~
+appended to ~$HOME/.config/direnv/direnvrc~ or dropped into
+~$HOME/.config/direnv/lib/~
 
 #+begin_src bash
 
@@ -37,19 +38,41 @@ appended to ~~/.config/direnv/direnvrc~ or dropped into ~~/.config/direnv/lib/~
 
 Add the ~use_cache~ function to the top of your ~.envrc~:
 
+#+begin_src bash :results output :wrap example
+cat envrc_with_cache
+#+end_src
 
+#+RESULTS:
 #+begin_example
-$> cat .envrc
+use_cache
+layout_poetry
 #+end_example
 
+If the cache does not exist or is invalid, ~use_cache~ will fall through to the
+rest of the .envrc, and then cache the resulting environment for future use.
 
+Note that ~direnv reload~ _may no longer do what you expect_: it will load from
+cache if possible. Delete the ~.env~ file to force a full reload.
 
-* Environment variables
+** Environment variables
 
-- ~DIRENV_CACHE_IGNORE~ ::
-- ~DIRENV_CACHE_DEBUG~ ::
+These are mostly for debugging purposes, but may come in handy:
 
-* Should this be built into direnv?
+- ~DIRENV_CACHE_IGNORE~ :: if set, the cache will always be ignored.
+- ~DIRENV_CACHE_DEBUG~ :: if set, some debugging output will be printed. if >1,
+  more verbose debugging output is available.
+
+* Opportunities for improving
+
+A couple of things could be done by building this directly into ~direnv~:
+
+1. Currently we can't figure out why the envrc is being evaluated: we can't
+   distinguish between precmd, direnv reload and chwpd. Since we only need to
+   test cache validity in the last case, this could improve efficiency.
+2. ~direnv current~ tests 1 file at a time; we could have a higher-level check
+   that tests whether the existing env. is current.
+3. The output of ~direnv export~ requires processing to convert to dotenv format.
+   We could support ~direnv export dotenv~.
 
 * Implementation Notes
 
