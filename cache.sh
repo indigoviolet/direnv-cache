@@ -1,11 +1,10 @@
 # shellcheck disable=SC2155
+# shellcheck disable=SC1090
 
 # Main entry point
 
 # [[file:README.org::*Main entry point][Main entry point:1]]
 use_cache() {
-    # show_dump $DIRENV_WATCHES
-
     [[ -v DIRENV_CACHE_IGNORE ]] && {
         _debug "Ignoring cache, DIRENV_CACHE_IGNORE is set"
         return
@@ -14,58 +13,51 @@ use_cache() {
         set_x
         set -uo pipefail
     }
-    echo "$DIRENV_WATCHES"
-    local cache_file="${1:-$(pwd)/.env}"
-    shift
-    if ! cache_is_valid "$cache_file" "$@"; then
-        build_cache "$cache_file" || {
-            _debug "Cache build failed"
-            exit $?
-        }
-    fi
+    local cache_filename=${1:-.env}
+    local cache_file=$(get_cache_file "$cache_filename")
 
-    _debug "Loading from cache ${cache_file}"
-    dotenv_if_exists "$cache_file"
-    exit 0
+    # if cache exists and nonzero
+    if [[ -s "$cache_file" ]]; then
+        # Load preemptively
+        load_cache "$cache_file"
+        # Then verify (and reload if necessary)
+        verify_cache "$cache_file"
+    else
+        _debug "Rebuilding cache: ${cache_file} missing or zero"
+        build_and_load_cache "$cache_file"
+    fi
+    exit $?
 }
 # Main entry point:1 ends here
 
-# Check cache validity
+# Get cache file
 
-
-# [[file:README.org::*Check cache validity][Check cache validity:1]]
-cache_is_valid() {
-    # Checks cache validity, and returns 0 for valid cache, nonzero for invalid cache.
-    #
-    # * Parameters
-    #
-    # - cache_file
-    # - dependency_files :: an optional list of files that the cache file must be newer than
-    #
-    # * Conditions for valid cache
-    #
-    # 1. DIRENV_CACHE_REBUILD is not set (set this to force rebuilds)
-    # 2. cache file exists
-    # 3. cache file is newer than dependency files
-
-    [[ ! -v DIRENV_CACHE_REBUILD ]] || {
-        _debug "Rebuilding cache, DIRENV_CACHE_REBUILD is set"
-        return
-    }
-
-    local cache_file=${1:?"Cache file required"}
-    [[ -f "$cache_file" ]] || {
-        _debug "Cache invalid: $cache_file missing"
-        return
-    }
-    is_newest "$@" || {
-        _debug "Cache invalid: not newest"
-        return
-    }
-    _debug "Cache is valid"
-    true
+# [[file:README.org::*Get cache file][Get cache file:1]]
+get_cache_file() {
+    # Ensure the cache file is in the same directory as the RC file
+    local cache_filename=${1:?"Cache filename is required"}
+    local rcfile=$(find_up ".envrc")
+    builtin echo -n "${rcfile%%/.*}/$cache_filename"
 }
-# Check cache validity:1 ends here
+# Get cache file:1 ends here
+
+# Cache validity
+
+
+# [[file:README.org::*Cache validity][Cache validity:1]]
+verify_cache () {
+    local cache_file=${1:?"Cache file required"}
+
+    # runs direnv current for all .Path in $DIRENV_WATCHES (in parallel)
+    # xargs will return 0 only if the command is successful for all inputs
+    direnv show_dump "$DIRENV_WATCHES" | jq -r '.[]|.Path' | xargs -n1 -P0 direnv current
+    local status=$?
+    if [[ $status -gt 0 ]]; then
+        _debug "Cache is stale, rebuilding"
+        build_and_load_cache "$cache_file"
+    fi
+}
+# Cache validity:1 ends here
 
 # Build cache
 
@@ -84,35 +76,20 @@ build_cache() {
     # - jq :: to parse json export into dotenv format
 
     local cache_file=${1:?"Cache file required"}
-
-    # We use the login shell to capture any user config in the baseline
-    local shell=$(basename "$SHELL")
-    local working_dir=$(dirname "$cache_file")
-    local direnv=$(which direnv)
-
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
         local stderr_file=$(mktemp)
     else
         local stderr_file=/dev/null
     fi
 
-    # We first add the cache file to the watch list, and then export -- this
-    # makes the cache file be included in DIRENV_WATCHES in the cached env.
-    #
     # we use json/jq because the bash export uses $'' c-strings which are not
     # easy to get rid of with sed
-    local direnv_export_cmd="${direnv} export json"
-
     # DIRENV_LOG_FORMAT='' will turn off direnv logging
     # DIRENV_CACHE_IGNORE=1 so that we can build the cache without using it
-    local cache_contents=$(env -i \
-        --chdir "$working_dir" \
-        HOME="$HOME" \
-        TERM="$TERM" \
-        DIRENV_CACHE_IGNORE=1 \
-        DIRENV_LOG_FORMAT="" \
-        "$shell" -ilc "$direnv_export_cmd" 2>"$stderr_file" |
-                               jq -r 'to_entries | map("export \(.key)=\(.value|@sh)")[]')
+    local cache_contents=$(
+        set -o pipefail
+        env DIRENV_CACHE_IGNORE=1 DIRENV_LOG_FORMAT="" direnv export json 2>"$stderr_file" | jq -r 'to_entries | map("export \(.key)=\(.value|@sh)")[]'
+    )
 
     local status=$?
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
@@ -121,8 +98,8 @@ build_cache() {
         local stderr_content=""
     fi
     if [[ $status -eq 0 ]]; then
-        echo "$cache_contents" >"$cache_file"
-        _debug "Built ${shell} cache for ${working_dir}: ${cache_file} contents: <${cache_contents}> stderr: <$stderr_content>"
+        _debug "Built cache: ${cache_file} contents: <${cache_contents}> stderr: <$stderr_content>"
+        builtin echo -n "$cache_contents" >"$cache_file" || _debug "Cache build failed while writing to $cache_file"
         return
     else
         _debug "Cache build failed: $stderr_content"
@@ -131,46 +108,34 @@ build_cache() {
 }
 # Build cache:1 ends here
 
-# Dependency files
-
-# each time direnv enters the directory it has to load from .envrc
-
-# but on each prompt, it only reloads if the watch list indicates that the env is stale
+# Load cache
 
 
-
-# [[file:README.org::*Dependency files][Dependency files:1]]
-direnv show_dump $DIRENV_WATCHES | jq '.[].Path'
-# Dependency files:1 ends here
-
-# Is cache file the newest?
-
-
-# [[file:README.org::*Is cache file the newest?][Is cache file the newest?:1]]
-is_newest() {
-    # Checks if cache_file is newer than all dependency files. Returns 0 if yes, nonzero if not.
-    #
-    # * Parameters
-    #
-    # - cache_file
-    # - dependency files
-    [[ $# -eq 1 ]] && {
-        _debug "No dependencies"
-        return
-    }
-
+# [[file:README.org::*Load cache][Load cache:1]]
+load_cache() {
     local cache_file=${1:?"Cache file required"}
-    shift
-    for f in "$@"; do
-        [[ "$cache_file" -nt "$f" ]] || {
-            _debug "Cache invalid: $cache_file is older than $f"
-            return
-        }
-    done
-
-    true
+    # we could use dotenv instead, but we don't need `watch_file`, and this is compatible?
+    source "$cache_file" || {
+        _debug "Cache load failed: $cache_file"
+        exit $?
+    }
+    _debug "Loaded from cache $cache_file"
 }
-# Is cache file the newest?:1 ends here
+# Load cache:1 ends here
+
+# build_and_load
+
+
+# [[file:README.org::*build_and_load][build_and_load:1]]
+build_and_load_cache() {
+    local cache_file=${1:?"Cache file required"}
+    build_cache "$cache_file" || {
+        _debug "Cache build failed"
+        exit $?
+    }
+    load_cache "$cache_file"
+}
+# build_and_load:1 ends here
 
 # Debug printing
 

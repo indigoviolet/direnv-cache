@@ -40,37 +40,99 @@ Add the ~use_cache~ function to the top of your ~.envrc~:
 
 #+begin_example
 $> cat .envrc
-
 #+end_example
 
 
 
-* Cache validity
-
-1. The cache file ~.env~ exists
-2. It is newer than any "dependencies" - which are assumed to be all the files
-   that direnv is watching (see ~direnv help show_private~ or ~watch_file~ in the
-   [[https://direnv.net/man/direnv-stdlib.1.html][stdlib]])
-3. A rebuild can be forced by setting (via ~export~) ~DIRENV_CACHE_REBUILD~
-
 * Environment variables
 
 - ~DIRENV_CACHE_IGNORE~ ::
-- ~DIRENV_CACHE_REBUILD~ ::
 - ~DIRENV_CACHE_DEBUG~ ::
 
 * Should this be built into direnv?
 
 * Implementation Notes
-** behavior of DIRENV_WATCHES
 
-- when we first hit .envrc code, DIRENV_WATCHES is already set in the environment and contains the .envrc and allow file
-- if you add a watch manually, it will append to DIRENV_WATCHES
-- but ~direnv export json~ will only show the watches added in the envrc (by default only the .envrc and allow file)
-- ~dotenv_if_exists~ will ~watch_file~ .env (appending to DIRENV_WATCHES)
+** Rough model of how direnv works
 
+1. ~direnv hook <shell>~ sets up ~direnv export json~ to be called on each prompt
+   (~precmd~) and directory change (~chpwd~)
+2. upon ~chwpd~, if we are /entering/ a directory containing an ~envrc~, we execute it
+   in a subshell, compare the env from the subshell to our own, and then apply
+   that diff to our env. (/loading/).
+3. Note that the env in the subshell that ~direnv export json~ is executed in, is
+   carefully restored to the "pre-direnv" state, by reverting ~DIRENV_DIFF~.
+4. Several direnv-specific state tracking env variables are set - ex.
+   ~DIRENV_FILE~ (the envrc file), ~DIRENV_DIR~ (the directory containing the
+   envrc), ~DIRENV_WATCHES~ (name, mtime, existence of all watched files),
+   ~DIRENV_DIFF~ (the diff that was applied).
+5. Upon ~chwpd~, if we already have these variables in our environment, and are
+   leaving the ~DIRENV_DIR~, these tracking variables are unset, and the inverse
+   of ~DIRENV_DIFF~ is applied. (/unloading/)
+6. Upon ~precmd~, if ~DIRENV_WATCHES~ is /stale/ i.e, the watched files have changed,
+   direnv loads again (~direnv current~ implements this for one file at a time).
+7. ~direnv watch~ and friends add to ~DIRENV_WATCHES~, so they act as dependencies
+   for the env state.
 
-*** viewing dumps
+#+begin_src bash :results output
+direnv hook zsh
+#+end_src
+
+#+RESULTS:
+#+begin_example
+
+_direnv_hook() {
+  trap -- '' SIGINT;
+  eval "$("/home/linuxbrew/.linuxbrew/Cellar/direnv/2.30.3/bin/direnv" export zsh)";
+  trap - SIGINT;
+}
+typeset -ag precmd_functions;
+if [[ -z "${precmd_functions[(r)_direnv_hook]+1}" ]]; then
+  precmd_functions=( _direnv_hook ${precmd_functions[@]} )
+fi
+typeset -ag chpwd_functions;
+if [[ -z "${chpwd_functions[(r)_direnv_hook]+1}" ]]; then
+  chpwd_functions=( _direnv_hook ${chpwd_functions[@]} )
+fi
+#+end_example
+
+** How the cache works
+
+Caching is only useful when re-entering a directory that hasn't changed in the
+interim. In this case, we would like to restore our previous state.
+
+1. ~use_cache~ is the first statement in the ~envrc~, so it can short circuit if
+   loading from cache.
+
+   Here are the scenarios when the envrc is executed:
+
+   (use_cache sees a DIRENV_WATCHES containing only the envrc & allow. files)
+
+   |-----------------+-----------------------------+----------------------------+---------------------------|
+   | invocation mode | DIRENV_WATCHES              | cache verification needed? | cache action              |
+   |-----------------+-----------------------------+----------------------------+---------------------------|
+   | precmd          | set, stale                  | no - known to be invalid   | rebuild                   |
+   | direnv reload   | set, irrelevant             | no - forced reload         | rebuild                   |
+   | chdir (enter)   | unset or from a previous RC | yes - might be stale       | rebuild if cache is valid |
+   |-----------------+-----------------------------+----------------------------+---------------------------|
+
+   Unfortunately, there doesn't appear to be any way to know which of these
+   invocation modes we are in -- since the envrc always executes in a "clean"
+   subshell.
+
+   All we know is that direnv wants to execute the envrc; we can test whether
+   the cache is valid (based on whether the cached DIRENV_WATCHES is stale), and
+   rebuild if it is not, or load from cache if valid.
+
+2. building the cache: run ~direnv export json~ in a clean subshell, and convert
+   that into ~dotenv~ format into ~.env~ (using ~jq~)
+3. if the cache is valid: load it via ~dotenv_if_exists~, otherwise build it
+4. some extra env switches are provided to help debug things:
+   ~DIRENV_CACHE_IGNORE~, ~DIRENV_CACHE_DEBUG~
+
+*** deserializing DIRENV_WATCHES
+
+DIRENV_WATCHES is in gzenv format, ie base64-urlencoded + zlib + json
 
 #+begin_src bash
 direnv show_dump $DIRENV_WATCHES
@@ -80,42 +142,161 @@ direnv show_dump $DIRENV_WATCHES
 echo $DIRENV_WATCHES | python -c "import sys; import zlib; import base64; print(zlib.decompress(base64.urlsafe_b64decode(sys.stdin.read())).decode('utf-8'))" | jq '.'
 #+end_src
 
-
-** implementation notes
-
-- We build the cache by running ~direnv export json~ in a subshell with a (mostly)
-  clean environment (while ignoring caching), and then formatting the JSON into
-  dotenv with ~jq~. This is then dumped into .env.
-
-
+#+begin_src bash
+{ printf "\x1f\x8b\x08\x00\x00\x00\x00\x00" ; echo $DIRENV_WATCHES | basenc --base64url -d ; } | gzip -d | jq '.'
+#+end_src
 *** Watching .env
 
-.env will get watched when we use ~dotenv_if_exists~, which modifies
-DIRENV_WATCHES, but then immediately the DIRENV_WATCHES from the cache will
-overwrite this, so that .env will not be watched.
+~dotenv_if_exists~ will usually ~watch_file~ ~.env~, which modifies ~DIRENV_WATCHES~,
+but then immediately the ~DIRENV_WATCHES~ from the cache will overwrite this, so
+that .env will not be watched.
 
-Do we want to watch the cache file? I don't think so: users shouldn't be
+Do we even  _want_ to watch the cache file? I don't think so: users shouldn't be
 modifying it directly; if deleted, it will get recreated the next time ~direnv~
 tries to load something.
 
-Attempting to get the cache file into DIRENV_WATCHES turns out to be difficult -
-you need to first set the .env's DIRENV_WATCHES into the environment (to capture
-any watches set in .envrc), and then ~watch_file .env~, and then append that new
-DIRENV_WATCHES into .env (overriding the previous export).
+**** Note, if we end up wanting to watch .env
 
-TODO: Can we do it like below, in one step?
+Attempting to get the cache file into DIRENV_WATCHES is tricky:
 
-#+begin_example
+- DIRENV_WATCHES is captured in the subshell, and won't contain .env by default.
+  We do need to capture DIRENV_WATCHES, since the .envrc could be registering
+  files to watch.
+- the first problem is mentioned above: ~dotenv_if_exists~ will ~watch_file~ on the
+  cache file but the resulting DIRENV_WATCHES will be lost when the cache is
+  actually loaded.
+- So we need to ~watch_file .env~ after the cache is created and loaded; this
+  generates a new DIRENV_WATCHES containing the current stat of .env. But if we
+  modify .env after this to update the cached value of DIRENV_WATCHES, our cache
+  will appear invalid (since DIRENV_WATCHES is stale), and we will rebuild the
+  cache.
+- The trick could be to first update .env with a DIRENV_WATCHES value that
+  includes itself, and then the env, as below. Here we are appending a second
+  ~export~ of DIRENV_WATCHES to .env, which will override the earlier one.
+
+#+begin_example bash
 { direnv watch json .env | jq -r '"export DIRENV_WATCHES=\(.DIRENV_WATCHES|@sh)"' >> .env; eval $(direnv watch zsh .env); }
 #+end_example
 
+*** Benchmarking
+
+**** Setup
+
+#+begin_src toml :tangle pyproject.toml
+[tool.poetry]
+name = "direnv-cache-test"
+version = "0.1.0"
+description = "Test project for benchmarking direnv-cache."
+authors = ["Venky Iyer <indigoviolet@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+
+[build-system]
+requires = ["poetry>=0.12"]
+build-backend = "poetry.masonry.api"
+#+end_src
+
+#+begin_src conf :tangle envrc_with_cache
+use_cache
+layout_poetry
+#+end_src
+
+#+begin_src conf :tangle envrc_without_cache
+layout_poetry
+#+end_src
 
 
+#+begin_src conf :tangle tool-versions
+python 3.8.1
+#+end_src
+
+#+begin_src bash :results output
+brew install hyperfine
+#+end_src
+
+#+begin_src bash :results output
+cp cache.sh ~/.config/direnv/05-cache.sh
+icdiff cache.sh ~/.config/direnv/05-cache.sh
+#+end_src
+
+#+RESULTS:
+
+**** Create directories
+
+#+name: dir-vars
+#+begin_src bash
+WITH_CACHE_DIR=/tmp/with_cache WITHOUT_CACHE_DIR=/tmp/without_cache
+#+end_src
+
+#+RESULTS: dir-vars
+
+#+begin_src bash :results output :include dir-vars :prologue "exec 2>&1"
+rm $WITH_CACHE_DIR $WITHOUT_CACHE_DIR -rf
+mkdir $WITH_CACHE_DIR $WITHOUT_CACHE_DIR
+ln -sf $(realpath pyproject.toml) $WITH_CACHE_DIR/
+ln -sf $(realpath tool-versions) $WITH_CACHE_DIR/
+( cd $WITH_CACHE_DIR && poetry install )
+ln -sf $(realpath envrc_with_cache) $WITH_CACHE_DIR/.envrc
+direnv allow $WITH_CACHE_DIR/.envrc
+
+ln -sf $(realpath pyproject.toml) $WITHOUT_CACHE_DIR/
+ln -sf $(realpath tool-versions) $WITHOUT_CACHE_DIR/
+( cd $WITHOUT_CACHE_DIR && poetry install )
+ln -sf $(realpath envrc_without_cache) $WITHOUT_CACHE_DIR/.envrc
+direnv allow $WITHOUT_CACHE_DIR/.envrc
+:
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Creating virtualenv direnv-cache-test in /tmp/with_cache/.venv
+Updating dependencies
+Resolving dependencies...
+
+Writing lock file
+Creating virtualenv direnv-cache-test in /tmp/without_cache/.venv
+Updating dependencies
+Resolving dependencies...
+
+Writing lock file
+#+end_example
 
 
+**** Results
+
+***** ensure cache
+#+begin_src bash :results output :prologue "exec 2>&1" :include dir-vars
+export DIRENV_CACHE_DEBUG=1
+direnv exec "$WITH_CACHE_DIR" bash -c "ls $WITH_CACHE_DIR/.env -al"
+:
+#+end_src
+
+#+RESULTS:
+: direnv: loading /tmp/with_cache/.envrc
+: Loaded from cache /tmp/with_cache/.env (status: 0)
+: -rw-rw-r-- 1 venky venky 1317 Mar 19 15:49 /tmp/with_cache/.env
 
 
+***** measure
+#+begin_src bash :results output :include dir-vars
+hyperfine -w 10 -L dir "$WITH_CACHE_DIR","$WITHOUT_CACHE_DIR" 'cd {dir}'
+#+end_src
 
+#+RESULTS:
+#+begin_example
+Benchmark 1: cd /tmp/with_cache
+  Time (mean ± σ):       0.0 ms ±   0.1 ms    [User: 0.1 ms, System: 0.1 ms]
+  Range (min … max):     0.0 ms …   1.5 ms    3353 runs
+
+Benchmark 2: cd /tmp/without_cache
+  Time (mean ± σ):       0.1 ms ±   0.1 ms    [User: 0.1 ms, System: 0.1 ms]
+  Range (min … max):     0.0 ms …   4.6 ms    3140 runs
+
+Summary
+  'cd /tmp/with_cache' ran
+    1.13 ± 3.65 times faster than 'cd /tmp/without_cache'
+#+end_example
 
 * Code
 :PROPERTIES:
@@ -126,13 +307,12 @@ TODO: Can we do it like below, in one step?
 
 #+begin_src bash :comments no
 # shellcheck disable=SC2155
+# shellcheck disable=SC1090
 #+end_src
 
 ** Main entry point
 #+begin_src bash
 use_cache() {
-    # show_dump $DIRENV_WATCHES
-
     [[ -v DIRENV_CACHE_IGNORE ]] && {
         _debug "Ignoring cache, DIRENV_CACHE_IGNORE is set"
         return
@@ -141,57 +321,48 @@ use_cache() {
         set_x
         set -uo pipefail
     }
-    echo "$DIRENV_WATCHES"
-    local cache_file="${1:-$(pwd)/.env}"
-    shift
-    if ! cache_is_valid "$cache_file" "$@"; then
-        build_cache "$cache_file" || {
-            _debug "Cache build failed"
-            exit $?
-        }
-    fi
+    local cache_filename=${1:-.env}
+    local cache_file=$(get_cache_file "$cache_filename")
 
-    _debug "Loading from cache ${cache_file}"
-    dotenv_if_exists "$cache_file"
-    exit 0
+    # if cache exists and nonzero
+    if [[ -s "$cache_file" ]]; then
+        # Load preemptively
+        load_cache "$cache_file"
+        # Then verify (and reload if necessary)
+        verify_cache "$cache_file"
+    else
+        _debug "Rebuilding cache: ${cache_file} missing or zero"
+        build_and_load_cache "$cache_file"
+    fi
+    exit $?
 }
 #+end_src
 
-** Check cache validity
+*** Get cache file
+#+begin_src bash
+get_cache_file() {
+    # Ensure the cache file is in the same directory as the RC file
+    local cache_filename=${1:?"Cache filename is required"}
+    local rcfile=$(find_up ".envrc")
+    builtin echo -n "${rcfile%%/.*}/$cache_filename"
+}
+#+end_src
+
+** Cache validity
 
 #+begin_src bash
-cache_is_valid() {
-    # Checks cache validity, and returns 0 for valid cache, nonzero for invalid cache.
-    #
-    # * Parameters
-    #
-    # - cache_file
-    # - dependency_files :: an optional list of files that the cache file must be newer than
-    #
-    # * Conditions for valid cache
-    #
-    # 1. DIRENV_CACHE_REBUILD is not set (set this to force rebuilds)
-    # 2. cache file exists
-    # 3. cache file is newer than dependency files
-
-    [[ ! -v DIRENV_CACHE_REBUILD ]] || {
-        _debug "Rebuilding cache, DIRENV_CACHE_REBUILD is set"
-        return
-    }
-
+verify_cache () {
     local cache_file=${1:?"Cache file required"}
-    [[ -f "$cache_file" ]] || {
-        _debug "Cache invalid: $cache_file missing"
-        return
-    }
-    is_newest "$@" || {
-        _debug "Cache invalid: not newest"
-        return
-    }
-    _debug "Cache is valid"
-    true
-}
 
+    # runs direnv current for all .Path in $DIRENV_WATCHES (in parallel)
+    # xargs will return 0 only if the command is successful for all inputs
+    direnv show_dump "$DIRENV_WATCHES" | jq -r '.[]|.Path' | xargs -n1 -P0 direnv current
+    local status=$?
+    if [[ $status -gt 0 ]]; then
+        _debug "Cache is stale, rebuilding"
+        build_and_load_cache "$cache_file"
+    fi
+}
 #+end_src
 
 ** Build cache
@@ -210,35 +381,20 @@ build_cache() {
     # - jq :: to parse json export into dotenv format
 
     local cache_file=${1:?"Cache file required"}
-
-    # We use the login shell to capture any user config in the baseline
-    local shell=$(basename "$SHELL")
-    local working_dir=$(dirname "$cache_file")
-    local direnv=$(which direnv)
-
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
         local stderr_file=$(mktemp)
     else
         local stderr_file=/dev/null
     fi
 
-    # We first add the cache file to the watch list, and then export -- this
-    # makes the cache file be included in DIRENV_WATCHES in the cached env.
-    #
     # we use json/jq because the bash export uses $'' c-strings which are not
     # easy to get rid of with sed
-    local direnv_export_cmd="${direnv} export json"
-
     # DIRENV_LOG_FORMAT='' will turn off direnv logging
     # DIRENV_CACHE_IGNORE=1 so that we can build the cache without using it
-    local cache_contents=$(env -i \
-        --chdir "$working_dir" \
-        HOME="$HOME" \
-        TERM="$TERM" \
-        DIRENV_CACHE_IGNORE=1 \
-        DIRENV_LOG_FORMAT="" \
-        "$shell" -ilc "$direnv_export_cmd" 2>"$stderr_file" |
-                               jq -r 'to_entries | map("export \(.key)=\(.value|@sh)")[]')
+    local cache_contents=$(
+        set -o pipefail
+        env DIRENV_CACHE_IGNORE=1 DIRENV_LOG_FORMAT="" direnv export json 2>"$stderr_file" | jq -r 'to_entries | map("export \(.key)=\(.value|@sh)")[]'
+    )
 
     local status=$?
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
@@ -247,8 +403,8 @@ build_cache() {
         local stderr_content=""
     fi
     if [[ $status -eq 0 ]]; then
-        echo "$cache_contents" >"$cache_file"
-        _debug "Built ${shell} cache for ${working_dir}: ${cache_file} contents: <${cache_contents}> stderr: <$stderr_content>"
+        _debug "Built cache: ${cache_file} contents: <${cache_contents}> stderr: <$stderr_content>"
+        builtin echo -n "$cache_contents" >"$cache_file" || _debug "Cache build failed while writing to $cache_file"
         return
     else
         _debug "Cache build failed: $stderr_content"
@@ -257,50 +413,33 @@ build_cache() {
 }
 #+end_src
 
-** Dependency files
-
-each time direnv enters the directory it has to load from .envrc
-
-but on each prompt, it only reloads if the watch list indicates that the env is stale
-
+** Load cache
 
 #+begin_src bash
-direnv show_dump $DIRENV_WATCHES | jq '.[].Path'
-#+end_src
-
-
-# get_watch_files() {
-
-# }
-
-** Is cache file the newest?
-
-#+begin_src bash
-is_newest() {
-    # Checks if cache_file is newer than all dependency files. Returns 0 if yes, nonzero if not.
-    #
-    # * Parameters
-    #
-    # - cache_file
-    # - dependency files
-    [[ $# -eq 1 ]] && {
-        _debug "No dependencies"
-        return
-    }
-
+load_cache() {
     local cache_file=${1:?"Cache file required"}
-    shift
-    for f in "$@"; do
-        [[ "$cache_file" -nt "$f" ]] || {
-            _debug "Cache invalid: $cache_file is older than $f"
-            return
-        }
-    done
-
-    true
+    # we could use dotenv instead, but we don't need `watch_file`, and this is compatible?
+    source "$cache_file" || {
+        _debug "Cache load failed: $cache_file"
+        exit $?
+    }
+    _debug "Loaded from cache $cache_file"
 }
-
 #+end_src
+
+*** build_and_load
+
+#+begin_src bash
+build_and_load_cache() {
+    local cache_file=${1:?"Cache file required"}
+    build_cache "$cache_file" || {
+        _debug "Cache build failed"
+        exit $?
+    }
+    load_cache "$cache_file"
+}
+#+end_src
+
 
 ** Debug printing
 #+begin_src bash
