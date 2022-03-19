@@ -39,7 +39,7 @@ appended to ~$HOME/.config/direnv/direnvrc~ or dropped into
 
 Add the ~use_cache~ function to the top of your ~.envrc~:
 
-#+begin_src bash :results output :wrap example
+#+begin_src bash :results output :wrap example :exports both
 cat envrc_with_cache
 #+end_src
 
@@ -98,7 +98,7 @@ A couple of things could be done by building this directly into ~direnv~:
 7. ~direnv watch~ and friends add to ~DIRENV_WATCHES~, so they act as dependencies
    for the env state.
 
-#+begin_src bash :results output
+#+begin_src bash :results output :exports both
 direnv hook zsh
 #+end_src
 
@@ -303,7 +303,7 @@ direnv exec "$WITH_CACHE_DIR" bash -c "ls $WITH_CACHE_DIR/.env -al"
 
 
 ***** measure
-#+begin_src bash :results output :include dir-vars
+#+begin_src bash :results output :include dir-vars :exports both
 hyperfine -w 10 -L dir "$WITH_CACHE_DIR","$WITHOUT_CACHE_DIR" 'cd {dir}'
 #+end_src
 
