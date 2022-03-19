@@ -1,5 +1,4 @@
 :DOC-CONFIG:
-#+property: header-args :exports both
 #+startup: fold
 #+title: Direnv caching
 #+author: Venky Iyer
