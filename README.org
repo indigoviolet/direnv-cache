@@ -13,27 +13,23 @@ This is an implementation of caching for [[https://direnv.net/][direnv]].
 that has not changed since we last left it; we can restore the environment
 without fully executing the .envrc.
 
-* Motivation
-
-I use direnv for setting up [[https://python-poetry.org/][Poetry]] ([[https://github.com/direnv/direnv/wiki/Python#poetry][layout_poetry]]) or conda, and in these
-scenarios, the environment created via direnv doesn't change all that often, and
-is amenable to caching.
-
-I also use direnv in Emacs ([[https://github.com/purcell/envrc][envrc]]), and having fast loads would make my editor
-start up faster.
-
-I could create a ~.env~ manually but it's convenient to define it using direnv's
-primitives.
-
 * Installation
 
-The accompanying file [[cache.sh][cache.sh]] should be dropped into direnv's library: either
-appended to ~$HOME/.config/direnv/direnvrc~ or dropped into
-~$HOME/.config/direnv/lib/~
+The accompanying file [[cache.sh][cache.sh]] should be added into direnv's library,
 
-#+begin_src bash
+- by dropping into ~$HOME/.config/direnv/lib~
 
-#+end_src
+  #+begin_src bash
+  curl -sSL https://raw.githubusercontent.com/indigoviolet/direnv-cache/main/cache.sh -o $HOME/.config/direnv/lib/05-cache.sh
+  #+end_src
+
+- *or* by appending to direnvrc
+
+  #+begin_src bash
+  curl -sSL https://raw.githubusercontent.com/indigoviolet/direnv-cache/main/cache.sh >> $HOME/.config/direnv/direnvrc
+  #+end_src
+
+- [[https://stedolan.github.io/jq/][jq]] should be available
 
 * Usage
 
@@ -52,7 +48,7 @@ layout_poetry
 If the cache does not exist or is invalid, ~use_cache~ will fall through to the
 rest of the .envrc, and then cache the resulting environment for future use.
 
-Note that ~direnv reload~ _may no longer do what you expect_: it will load from
+Note that ~direnv reload~ *may no longer do what you expect*: it will load from
 cache if possible. Delete the ~.env~ file to force a full reload.
 
 ** Environment variables
@@ -67,13 +63,34 @@ These are mostly for debugging purposes, but may come in handy:
 
 A couple of things could be done by building this directly into ~direnv~:
 
-1. Currently we can't figure out why the envrc is being evaluated: we can't
-   distinguish between precmd, direnv reload and chwpd. Since we only need to
-   test cache validity in the last case, this could improve efficiency.
-2. ~direnv current~ tests 1 file at a time; we could have a higher-level check
-   that tests whether the existing env. is current.
+1. Currently we are unable to figure out /why/ the envrc is being evaluated: we
+   can't distinguish between ~precmd~, ~direnv reload~ and ~chwpd~. It would be nice
+   for direnv to hint this, perhaps via an environment variable. Since we only
+   need to test cache validity in the last case, this could improve performance
+   in the first two cases. Our current implementation has to test cache validity
+   in all three cases. (See [[#how-the-cache-works][explanation]])
+2. ~direnv current~ tests 1 watched file from ~DIRENV_WATCHES~ at a time; we could
+   have a higher-level check that tests whether the existing environment is
+   current.
 3. The output of ~direnv export~ requires processing to convert to dotenv format.
    We could support ~direnv export dotenv~.
+
+* Benchmarking
+
+See [[#measurements][details below]]. The average improvement isn't dramatic in my measurements,
+but it depends on how expensive the envrc is.
+
+* Motivation
+
+I use direnv for setting up [[https://python-poetry.org/][Poetry]] ([[https://github.com/direnv/direnv/wiki/Python#poetry][layout_poetry]]) or conda, and in these
+scenarios, the environment created via direnv doesn't change all that often, and
+is amenable to caching.
+
+I also use direnv in Emacs ([[https://github.com/purcell/envrc][envrc]]), and having fast loads would make my editor
+start up faster.
+
+I could create a ~.env~ manually but it's convenient to define it using direnv's
+primitives.
 
 * Implementation Notes
 
@@ -104,7 +121,6 @@ direnv hook zsh
 
 #+RESULTS:
 #+begin_example
-
 _direnv_hook() {
   trap -- '' SIGINT;
   eval "$("/home/linuxbrew/.linuxbrew/Cellar/direnv/2.30.3/bin/direnv" export zsh)";
@@ -202,9 +218,9 @@ Attempting to get the cache file into DIRENV_WATCHES is tricky:
 { direnv watch json .env | jq -r '"export DIRENV_WATCHES=\(.DIRENV_WATCHES|@sh)"' >> .env; eval $(direnv watch zsh .env); }
 #+end_example
 
-*** Benchmarking
+** Benchmarking
 
-**** Setup
+*** Setup
 
 #+begin_src toml :tangle pyproject.toml
 [tool.poetry]
@@ -246,7 +262,7 @@ icdiff cache.sh ~/.config/direnv/05-cache.sh
 
 #+RESULTS:
 
-**** Create directories
+*** Create directories
 
 #+name: dir-vars
 #+begin_src bash
@@ -287,9 +303,9 @@ Writing lock file
 #+end_example
 
 
-**** Results
+*** Results
 
-***** ensure cache
+**** ensure cache
 #+begin_src bash :results output :prologue "exec 2>&1" :include dir-vars
 export DIRENV_CACHE_DEBUG=1
 direnv exec "$WITH_CACHE_DIR" bash -c "ls $WITH_CACHE_DIR/.env -al"
@@ -302,7 +318,7 @@ direnv exec "$WITH_CACHE_DIR" bash -c "ls $WITH_CACHE_DIR/.env -al"
 : -rw-rw-r-- 1 venky venky 1317 Mar 19 15:49 /tmp/with_cache/.env
 
 
-***** measure
+**** Measurements
 #+begin_src bash :results output :include dir-vars :exports both
 hyperfine -w 10 -L dir "$WITH_CACHE_DIR","$WITHOUT_CACHE_DIR" 'cd {dir}'
 #+end_src
@@ -393,17 +409,6 @@ verify_cache () {
 
 #+begin_src bash
 build_cache() {
-    # Builds the cache by calling ~direnv export~ in a clean login shell (which
-    # is the "base" environment to diff against).
-    #
-    # * Parameters:
-    #
-    # - cache_file :: the dotenv file to cache into
-    #
-    # * Requirements:
-    #
-    # - jq :: to parse json export into dotenv format
-
     local cache_file=${1:?"Cache file required"}
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
         local stderr_file=$(mktemp)

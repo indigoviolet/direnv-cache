@@ -64,17 +64,6 @@ verify_cache () {
 
 # [[file:README.org::*Build cache][Build cache:1]]
 build_cache() {
-    # Builds the cache by calling ~direnv export~ in a clean login shell (which
-    # is the "base" environment to diff against).
-    #
-    # * Parameters:
-    #
-    # - cache_file :: the dotenv file to cache into
-    #
-    # * Requirements:
-    #
-    # - jq :: to parse json export into dotenv format
-
     local cache_file=${1:?"Cache file required"}
     if [[ -v DIRENV_CACHE_DEBUG ]]; then
         local stderr_file=$(mktemp)
