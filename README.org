@@ -13,6 +13,21 @@ This is an implementation of caching for [[https://direnv.net/][direnv]].
 that has not changed since we last left it; we can restore the environment
 without fully executing the .envrc.
 
+* Contents
+:PROPERTIES:
+:TOC:      :include siblings :depth 1 :ignore this
+:END:
+
+:CONTENTS:
+- [[#installation][Installation]]
+- [[#usage][Usage]]
+- [[#opportunities-for-improvements][Opportunities for improvements]]
+- [[#benchmarking][Benchmarking]]
+- [[#motivation][Motivation]]
+- [[#implementation-notes][Implementation Notes]]
+- [[#code][Code]]
+:END:
+
 * Installation
 
 The accompanying file [[cache.sh][cache.sh]] should be added into direnv's library,
@@ -59,9 +74,9 @@ These are mostly for debugging purposes, but may come in handy:
 - ~DIRENV_CACHE_DEBUG~ :: if set, some debugging output will be printed. if >1,
   more verbose debugging output is available.
 
-* Opportunities for improving
+* Opportunities for improvements
 
-A couple of things could be done by building this directly into ~direnv~:
+A few additions to the core of direnv could make this better:
 
 1. Currently we are unable to figure out /why/ the envrc is being evaluated: we
    can't distinguish between ~precmd~, ~direnv reload~ and ~chwpd~. It would be nice
@@ -77,8 +92,8 @@ A couple of things could be done by building this directly into ~direnv~:
 
 * Benchmarking
 
-See [[#measurements][details below]]. The average improvement isn't dramatic in my measurements,
-but it depends on how expensive the envrc is.
+See [[#measurements][details below]]. The average improvement isn't dramatic in my measurements
+(with ~layout_poetry~), but it depends on how expensive the envrc is.
 
 * Motivation
 
