@@ -48,9 +48,9 @@ get_cache_file() {
 verify_cache () {
     local cache_file=${1:?"Cache file required"}
 
-    # runs direnv current for all .Path in $DIRENV_WATCHES (in parallel)
+    # runs direnv current for all .path in $DIRENV_WATCHES (in parallel)
     # xargs will return 0 only if the command is successful for all inputs
-    direnv show_dump "$DIRENV_WATCHES" | jq -r '.[]|.Path' | xargs -n1 -P0 direnv current
+    direnv show_dump "$DIRENV_WATCHES" | jq -r '.[]|.path' | xargs -n1 -P0 direnv current
     local status=$?
     if [[ $status -gt 0 ]]; then
         _debug "Cache is stale, rebuilding"
